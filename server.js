@@ -52,8 +52,12 @@ function computeStringProperties(value) {
 
 // ==================== ROUTES ====================
 
+// IMPORTANT: POST routes first (no conflicts)
 // 1. POST /strings - Create/Analyze String
 app.post('/strings', (req, res) => {
+  console.log('📝 POST /strings called');
+  console.log('Body:', req.body);
+
   if (!req.body) {
     return res.status(400).json({ 
       error: 'Bad Request',
@@ -95,12 +99,105 @@ app.post('/strings', (req, res) => {
   };
 
   stringsStorage.set(id, stringObject);
+  console.log('✅ String stored. Total:', stringsStorage.size);
+  
   res.status(201).json(stringObject);
 });
 
-// ⭐ IMPORTANT: PUT THIS ROUTE FIRST (BEFORE the :stringValue route)
+// DELETE routes next
+// 5. DELETE /strings/{string_value} - Delete String
+app.delete('/strings/:stringValue', (req, res) => {
+  const { stringValue } = req.params;
+  const hash = calculateHash(stringValue);
+
+  if (!stringsStorage.has(hash)) {
+    return res.status(404).json({ 
+      error: 'Not Found',
+      message: 'String does not exist in the system' 
+    });
+  }
+
+  stringsStorage.delete(hash);
+  res.status(204).send();
+});
+
+// GET routes - SPECIFIC routes BEFORE general routes
+// 4. GET /strings/filter-by-natural-language - Natural Language Filtering
+app.get('/strings/filter-by-natural-language', (req, res) => {
+  const { query } = req.query;
+
+  if (!query) {
+    return res.status(400).json({ 
+      error: 'Bad Request',
+      message: 'Missing "query" parameter' 
+    });
+  }
+
+  let parsedFilters = {};
+  const queryLower = query.toLowerCase();
+
+  if (queryLower.includes('palindrom')) {
+    parsedFilters.is_palindrome = true;
+  }
+
+  if (queryLower.includes('single word')) {
+    parsedFilters.word_count = 1;
+  }
+
+  const longerMatch = queryLower.match(/longer than (\d+)/);
+  if (longerMatch) {
+    parsedFilters.min_length = Number(longerMatch[1]) + 1;
+  }
+
+  if (queryLower.includes('first vowel') || queryLower.includes('vowel')) {
+    parsedFilters.contains_character = 'a';
+  }
+
+  const containsMatch = queryLower.match(/contains? (?:the letter|character)? ([a-z])/);
+  if (containsMatch) {
+    parsedFilters.contains_character = containsMatch[1];
+  }
+
+  if (Object.keys(parsedFilters).length === 0) {
+    return res.status(400).json({ 
+      error: 'Bad Request',
+      message: 'Unable to parse natural language query' 
+    });
+  }
+
+  let results = Array.from(stringsStorage.values());
+
+  if (parsedFilters.is_palindrome !== undefined) {
+    results = results.filter(item => item.properties.is_palindrome === parsedFilters.is_palindrome);
+  }
+
+  if (parsedFilters.word_count !== undefined) {
+    results = results.filter(item => item.properties.word_count === parsedFilters.word_count);
+  }
+
+  if (parsedFilters.min_length !== undefined) {
+    results = results.filter(item => item.properties.length >= parsedFilters.min_length);
+  }
+
+  if (parsedFilters.contains_character !== undefined) {
+    results = results.filter(item => item.value.includes(parsedFilters.contains_character));
+  }
+
+  res.status(200).json({
+    data: results,
+    count: results.length,
+    interpreted_query: {
+      original: query,
+      parsed_filters: parsedFilters
+    }
+  });
+});
+
 // 3. GET /strings - Get All Strings with Filtering
 app.get('/strings', (req, res) => {
+  console.log('📖 GET /strings called');
+  console.log('Storage size:', stringsStorage.size);
+  
   const { is_palindrome, min_length, max_length, word_count, contains_character } = req.query;
 
   let filters = {};
@@ -184,80 +281,7 @@ app.get('/strings', (req, res) => {
   });
 });
 
-// ⭐ IMPORTANT: PUT THIS ROUTE SECOND (BEFORE the :stringValue route)
-// 4. GET /strings/filter-by-natural-language - Natural Language Filtering
-app.get('/strings/filter-by-natural-language', (req, res) => {
-  const { query } = req.query;
-
-  if (!query) {
-    return res.status(400).json({ 
-      error: 'Bad Request',
-      message: 'Missing "query" parameter' 
-    });
-  }
-
-  let parsedFilters = {};
-  const queryLower = query.toLowerCase();
-
-  if (queryLower.includes('palindrom')) {
-    parsedFilters.is_palindrome = true;
-  }
-
-  if (queryLower.includes('single word')) {
-    parsedFilters.word_count = 1;
-  }
-
-  const longerMatch = queryLower.match(/longer than (\d+)/);
-  if (longerMatch) {
-    parsedFilters.min_length = Number(longerMatch[1]) + 1;
-  }
-
-  if (queryLower.includes('first vowel') || queryLower.includes('vowel')) {
-    parsedFilters.contains_character = 'a';
-  }
-
-  const containsMatch = queryLower.match(/contains? (?:the letter|character)? ([a-z])/);
-  if (containsMatch) {
-    parsedFilters.contains_character = containsMatch[1];
-  }
-
-  if (Object.keys(parsedFilters).length === 0) {
-    return res.status(400).json({ 
-      error: 'Bad Request',
-      message: 'Unable to parse natural language query' 
-    });
-  }
-
-  let results = Array.from(stringsStorage.values());
-
-  if (parsedFilters.is_palindrome !== undefined) {
-    results = results.filter(item => item.properties.is_palindrome === parsedFilters.is_palindrome);
-  }
-
-  if (parsedFilters.word_count !== undefined) {
-    results = results.filter(item => item.properties.word_count === parsedFilters.word_count);
-  }
-
-  if (parsedFilters.min_length !== undefined) {
-    results = results.filter(item => item.properties.length >= parsedFilters.min_length);
-  }
-
-  if (parsedFilters.contains_character !== undefined) {
-    results = results.filter(item => item.value.includes(parsedFilters.contains_character));
-  }
-
-  res.status(200).json({
-    data: results,
-    count: results.length,
-    interpreted_query: {
-      original: query,
-      parsed_filters: parsedFilters
-    }
-  });
-});
-
-// ⭐ IMPORTANT: PUT THIS ROUTE LAST (with :stringValue parameter)
-// 2. GET /strings/{string_value} - Get Specific String
+// 2. GET /strings/{string_value} - Get Specific String (LAST because it has :param)
 app.get('/strings/:stringValue', (req, res) => {
   const { stringValue } = req.params;
   const hash = calculateHash(stringValue);
@@ -271,22 +295,6 @@ app.get('/strings/:stringValue', (req, res) => {
 
   const stringObject = stringsStorage.get(hash);
   res.status(200).json(stringObject);
-});
-
-// 5. DELETE /strings/{string_value} - Delete String
-app.delete('/strings/:stringValue', (req, res) => {
-  const { stringValue } = req.params;
-  const hash = calculateHash(stringValue);
-
-  if (!stringsStorage.has(hash)) {
-    return res.status(404).json({ 
-      error: 'Not Found',
-      message: 'String does not exist in the system' 
-    });
-  }
-
-  stringsStorage.delete(hash);
-  res.status(204).send();
 });
 
 // ==================== ERROR HANDLING ====================
@@ -303,6 +311,7 @@ app.use((req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`String Analyzer Service is running on http://localhost:${PORT}`);
-  console.log(`Ready to analyze strings! `);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`✅ Ready!`);
 });
