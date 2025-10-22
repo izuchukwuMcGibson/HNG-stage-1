@@ -136,9 +136,9 @@ async function tryConnectMongoose() {
 app.get('/health', async (req, res) => {
   try {
     const count = await db.count();
-    res.json({ status: 'ok', storage_count: count, using_in_memory: useInMemory });
+    return res.json({ status: 'ok', storage_count: count, using_in_memory: useInMemory });
   } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
+    return  res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
@@ -320,7 +320,7 @@ app.get('/strings/:stringValue', async (req, res) => {
 
 // 404 fallback
 app.use((req, res) => {
-  res.status(404).json({ error: 'Not Found', message: 'Endpoint does not exist' });
+ return res.status(404).json({ error: 'Not Found', message: 'Endpoint does not exist' });
 });
 
 // ---------------- Start ----------------
