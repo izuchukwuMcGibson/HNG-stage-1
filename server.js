@@ -1,12 +1,21 @@
-import 'dotenv/config'; 
+import 'dotenv/config';
 import express from 'express';
 import mongoose from 'mongoose';
 import crypto from 'crypto';
 
 const app = express();
-app.use(express.json());
 
-// Simple CORS for testing
+/**
+ * NOTE: we intentionally allow express.json to parse requests even when the
+ * Content-Type header is missing in some test environments. This avoids a
+ * common situation where tests send raw JSON without the header and the body
+ * ends up empty (which previously caused POST to be treated as GET).
+ *
+ * If you prefer stricter behavior in production, change the `type` option.
+ */
+app.use(express.json({ limit: '1mb', type: '*/*' }));
+
+// Simple CORS for testing (safe for the task environment)
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
@@ -47,76 +56,56 @@ function computeStringProperties(value) {
   };
 }
 
-// ---------------- Persistence Abstraction ----------------
+// ---------------- Persistence (Mongoose fallback to in-memory) ----------------
 let useInMemory = true;
-let StringModel = null;
 const inMemoryStore = new Map();
 
-function mapDocToResponse(doc) {
-  return {
-    id: doc._id ?? doc.id,
-    value: doc.value,
-    properties: doc.properties,
-    created_at: doc.created_at
-  };
-}
-
-async function memInsert(doc) {
-  inMemoryStore.set(doc._id, doc);
-  return doc;
-}
-async function memFind(query = {}) {
-  const results = [];
-  const regexValue = query.value && query.value.$regex ? new RegExp(query.value.$regex, query.value.$options || '') : null;
-  for (const v of inMemoryStore.values()) {
-    let ok = true;
-    if (query['properties.is_palindrome'] !== undefined) ok = ok && v.properties.is_palindrome === query['properties.is_palindrome'];
-    if (query['properties.word_count'] !== undefined) ok = ok && v.properties.word_count === query['properties.word_count'];
-    if (query['properties.length'] && query['properties.length'].$gte !== undefined) ok = ok && v.properties.length >= query['properties.length'].$gte;
-    if (query['properties.length'] && query['properties.length'].$lte !== undefined) ok = ok && v.properties.length <= query['properties.length'].$lte;
-    if (regexValue) ok = ok && regexValue.test(v.value);
-    if (ok) results.push(v);
-  }
-  return results;
-}
-async function memFindOne(id) {
-  return inMemoryStore.get(id) || null;
-}
-async function memDeleteOne(id) {
-  const existed = inMemoryStore.delete(id);
-  return { deletedCount: existed ? 1 : 0 };
-}
-async function memCount() {
-  return inMemoryStore.size;
-}
-
 const stringSchema = new mongoose.Schema({
-  _id: { type: String },
+  _id: { type: String }, // SHA256 hash as _id
   value: { type: String, required: true },
   properties: { type: Object, required: true },
   created_at: { type: Date, default: () => new Date().toISOString() }
 }, { versionKey: false });
 
+let StringModel = null;
 let db = {
-  insert: memInsert,
-  find: async (q) => memFind(q),
-  findOneById: memFindOne,
-  deleteOneById: memDeleteOne,
-  count: memCount
+  insert: async (doc) => { inMemoryStore.set(doc._id, doc); return doc; },
+  find: async (query) => {
+    // simple in-memory query that supports the filters used in endpoints
+    const results = [];
+    const regexValue = query.value && query.value.$regex ? new RegExp(query.value.$regex, query.value.$options || '') : null;
+    for (const v of inMemoryStore.values()) {
+      let ok = true;
+      if (query['properties.is_palindrome'] !== undefined) ok = ok && v.properties.is_palindrome === query['properties.is_palindrome'];
+      if (query['properties.word_count'] !== undefined) ok = ok && v.properties.word_count === query['properties.word_count'];
+      if (query['properties.length'] && query['properties.length'].$gte !== undefined) ok = ok && v.properties.length >= query['properties.length'].$gte;
+      if (query['properties.length'] && query['properties.length'].$lte !== undefined) ok = ok && v.properties.length <= query['properties.length'].$lte;
+      if (regexValue) ok = ok && regexValue.test(v.value);
+      if (ok) results.push(v);
+    }
+    return results;
+  },
+  findOneById: async (id) => inMemoryStore.get(id) || null,
+  deleteOneById: async (id) => {
+    const existed = inMemoryStore.delete(id);
+    return { deletedCount: existed ? 1 : 0 };
+  },
+  count: async () => inMemoryStore.size
 };
 
 async function tryConnectMongoose() {
-  const MONGODB_URI = process.env.MONGODB_URI;
-  if (!MONGODB_URI) {
-    console.log('No MONGODB_URI found in environment — using in-memory store');
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    console.log('No MONGODB_URI provided: using in-memory store');
+    useInMemory = true;
     return;
   }
 
   try {
     mongoose.set('strictQuery', false);
-    await mongoose.connect(MONGODB_URI);
+    await mongoose.connect(uri);
     StringModel = mongoose.model('String', stringSchema);
-    useInMemory = false;
+    // swap db implementations
     db.insert = async (doc) => {
       const created = await StringModel.create(doc);
       return created.toObject ? created.toObject() : created;
@@ -126,24 +115,23 @@ async function tryConnectMongoose() {
       return docs;
     };
     db.findOneById = async (id) => {
-      const doc = await StringModel.findById(id).lean().exec();
-      return doc;
+      return await StringModel.findById(id).lean().exec();
     };
     db.deleteOneById = async (id) => {
       const res = await StringModel.deleteOne({ _id: id });
-      return { deletedCount: res.deletedCount ?? res.n ?? 0 };
+      return { deletedCount: res.deletedCount ?? res.deletedCount ?? 0 };
     };
-    db.count = async () => {
-      return await StringModel.countDocuments();
-    };
-    console.log('🔌 Connected to MongoDB via mongoose');
+    db.count = async () => await StringModel.countDocuments();
+    useInMemory = false;
+    console.log('Connected to MongoDB (mongoose). Using persistent storage.');
   } catch (err) {
-    console.error('Could not connect to MongoDB, falling back to in-memory store. Error:', err.message);
+    console.error('Could not connect to MongoDB — falling back to in-memory store. Error:', err.message);
     useInMemory = true;
   }
 }
 
-// ---------------- Routes (same as before) ----------------
+// ---------------- Routes (ordered carefully) ----------------
+
 // Health
 app.get('/health', async (req, res) => {
   try {
@@ -154,39 +142,57 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// POST /strings
+// 1) POST /strings - Create / Analyze
 app.post('/strings', async (req, res) => {
   try {
-    if (!req.body || !('value' in req.body)) {
+    // Validate presence of body and 'value' key explicitly
+    if (!req.body || typeof req.body !== 'object' || !Object.prototype.hasOwnProperty.call(req.body, 'value')) {
       return res.status(400).json({ error: 'Bad Request', message: 'Missing "value" field' });
     }
+
     const { value } = req.body;
+
     if (typeof value !== 'string') {
       return res.status(422).json({ error: 'Unprocessable Entity', message: '"value" must be a string' });
     }
+
     const properties = computeStringProperties(value);
     const id = properties.sha256_hash;
-    const doc = { _id: id, value, properties, created_at: new Date().toISOString() };
+
+    const doc = {
+      _id: id,
+      value,
+      properties,
+      created_at: new Date().toISOString()
+    };
+
+    if (useInMemory) {
+      if (inMemoryStore.has(id)) {
+        return res.status(409).json({ error: 'Conflict', message: 'String already exists in the system' });
+      }
+      const created = await db.insert(doc);
+      return res.status(201).json({ id: created._id, value: created.value, properties: created.properties, created_at: created.created_at });
+    }
+
+    // persistent (mongoose) branch
     try {
       const created = await db.insert(doc);
-      return res.status(201).json(mapDocToResponse(created));
+      return res.status(201).json({ id: created._id, value: created.value, properties: created.properties, created_at: created.created_at });
     } catch (err) {
-      if (!useInMemory && err && err.code === 11000) {
+      // Duplicate key error
+      if (err && (err.code === 11000 || (err.name === 'MongoServerError' && err.code === 11000))) {
         return res.status(409).json({ error: 'Conflict', message: 'String already exists in the system' });
       }
-      if (useInMemory && inMemoryStore.has(id)) {
-        return res.status(409).json({ error: 'Conflict', message: 'String already exists in the system' });
-      }
-      console.error('POST /strings unexpected error:', err);
+      console.error('POST /strings unexpected DB error:', err);
       return res.status(500).json({ error: 'Internal Server Error' });
     }
   } catch (err) {
-    console.error('POST /strings error', err);
-    res.status(500).json({ error: 'Internal Server Error' });
+    console.error('POST /strings error:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
-// DELETE /strings/:stringValue
+// 2) DELETE /strings/:stringValue - Delete
 app.delete('/strings/:stringValue', async (req, res) => {
   try {
     const id = calculateHash(req.params.stringValue);
@@ -194,14 +200,15 @@ app.delete('/strings/:stringValue', async (req, res) => {
     if (!result || result.deletedCount === 0) {
       return res.status(404).json({ error: 'Not Found', message: 'String does not exist in the system' });
     }
+    // Must return 204 No Content with empty body
     return res.status(204).send();
   } catch (err) {
-    console.error('DELETE error', err);
-    res.status(500).json({ error: 'Internal Server Error' });
+    console.error('DELETE /strings error:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
-// GET /strings/filter-by-natural-language
+// 3) GET /strings/filter-by-natural-language - specific route BEFORE general
 app.get('/strings/filter-by-natural-language', async (req, res) => {
   try {
     const q = req.query.query;
@@ -209,6 +216,7 @@ app.get('/strings/filter-by-natural-language', async (req, res) => {
 
     const queryLower = q.toLowerCase();
     const parsed = {};
+
     if (queryLower.includes('palindrom')) parsed.is_palindrome = true;
     if (queryLower.includes('single word')) parsed.word_count = 1;
     const longerMatch = queryLower.match(/longer than (\d+)/);
@@ -220,40 +228,37 @@ app.get('/strings/filter-by-natural-language', async (req, res) => {
       return res.status(400).json({ error: 'Bad Request', message: 'Unable to parse natural language query' });
     }
 
-    const dbQuery = {};
-    if (parsed.is_palindrome !== undefined) dbQuery['properties.is_palindrome'] = parsed.is_palindrome;
-    if (parsed.word_count !== undefined) dbQuery['properties.word_count'] = parsed.word_count;
-    if (parsed.min_length !== undefined) dbQuery['properties.length'] = { $gte: parsed.min_length };
+    const mongoQuery = {};
+    if (parsed.is_palindrome !== undefined) mongoQuery['properties.is_palindrome'] = parsed.is_palindrome;
+    if (parsed.word_count !== undefined) mongoQuery['properties.word_count'] = parsed.word_count;
+    if (parsed.min_length !== undefined) mongoQuery['properties.length'] = { $gte: parsed.min_length };
     if (parsed.contains_character !== undefined) {
       const ch = parsed.contains_character.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      dbQuery['value'] = { $regex: ch, $options: 'i' };
+      mongoQuery['value'] = { $regex: ch, $options: 'i' };
     }
 
-    const results = await db.find(dbQuery);
-    res.json({
-      data: results.map(mapDocToResponse),
-      count: results.length,
-      interpreted_query: { original: q, parsed_filters: parsed }
-    });
+    const results = await db.find(mongoQuery);
+    const payload = results.map(r => ({ id: r._id ?? r.id, value: r.value, properties: r.properties, created_at: r.created_at }));
+    return res.status(200).json({ data: payload, count: payload.length, interpreted_query: { original: q, parsed_filters: parsed } });
   } catch (err) {
-    console.error('NLP filter error', err);
-    res.status(500).json({ error: 'Internal Server Error' });
+    console.error('GET /strings/filter-by-natural-language error:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
-// GET /strings (with query filters)
+// 4) GET /strings - general (after specific)
 app.get('/strings', async (req, res) => {
   try {
     const { is_palindrome, min_length, max_length, word_count, contains_character } = req.query;
     const filtersApplied = {};
-    const dbQuery = {};
+    const mongoQuery = {};
 
     if (is_palindrome !== undefined) {
       if (is_palindrome !== 'true' && is_palindrome !== 'false') {
         return res.status(400).json({ error: 'Bad Request', message: 'is_palindrome must be "true" or "false"' });
       }
       filtersApplied.is_palindrome = is_palindrome === 'true';
-      dbQuery['properties.is_palindrome'] = filtersApplied.is_palindrome;
+      mongoQuery['properties.is_palindrome'] = filtersApplied.is_palindrome;
     }
 
     if (min_length !== undefined) {
@@ -261,8 +266,8 @@ app.get('/strings', async (req, res) => {
         return res.status(400).json({ error: 'Bad Request', message: 'min_length must be integer' });
       }
       filtersApplied.min_length = Number(min_length);
-      dbQuery['properties.length'] = dbQuery['properties.length'] || {};
-      dbQuery['properties.length'].$gte = filtersApplied.min_length;
+      mongoQuery['properties.length'] = mongoQuery['properties.length'] || {};
+      mongoQuery['properties.length'].$gte = filtersApplied.min_length;
     }
 
     if (max_length !== undefined) {
@@ -270,8 +275,8 @@ app.get('/strings', async (req, res) => {
         return res.status(400).json({ error: 'Bad Request', message: 'max_length must be integer' });
       }
       filtersApplied.max_length = Number(max_length);
-      dbQuery['properties.length'] = dbQuery['properties.length'] || {};
-      dbQuery['properties.length'].$lte = filtersApplied.max_length;
+      mongoQuery['properties.length'] = mongoQuery['properties.length'] || {};
+      mongoQuery['properties.length'].$lte = filtersApplied.max_length;
     }
 
     if (word_count !== undefined) {
@@ -279,7 +284,7 @@ app.get('/strings', async (req, res) => {
         return res.status(400).json({ error: 'Bad Request', message: 'word_count must be integer' });
       }
       filtersApplied.word_count = Number(word_count);
-      dbQuery['properties.word_count'] = filtersApplied.word_count;
+      mongoQuery['properties.word_count'] = filtersApplied.word_count;
     }
 
     if (contains_character !== undefined) {
@@ -288,27 +293,28 @@ app.get('/strings', async (req, res) => {
       }
       filtersApplied.contains_character = contains_character;
       const ch = contains_character.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      dbQuery['value'] = { $regex: ch, $options: 'i' };
+      mongoQuery['value'] = { $regex: ch, $options: 'i' };
     }
 
-    const docs = await db.find(dbQuery);
-    res.json({ data: docs.map(mapDocToResponse), count: docs.length, filters_applied: Object.keys(filtersApplied).length ? filtersApplied : 'none' });
+    const docs = await db.find(mongoQuery);
+    const data = docs.map(r => ({ id: r._id ?? r.id, value: r.value, properties: r.properties, created_at: r.created_at }));
+    return res.status(200).json({ data, count: data.length, filters_applied: Object.keys(filtersApplied).length ? filtersApplied : 'none' });
   } catch (err) {
-    console.error('GET /strings error', err);
-    res.status(500).json({ error: 'Internal Server Error' });
+    console.error('GET /strings error:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
-// GET single
+// 5) GET /strings/:stringValue - parameterized route LAST
 app.get('/strings/:stringValue', async (req, res) => {
   try {
     const id = calculateHash(req.params.stringValue);
     const doc = await db.findOneById(id);
     if (!doc) return res.status(404).json({ error: 'Not Found', message: 'String does not exist in the system' });
-    res.json(mapDocToResponse(doc));
+    return res.status(200).json({ id: doc._id ?? doc.id, value: doc.value, properties: doc.properties, created_at: doc.created_at });
   } catch (err) {
-    console.error('GET single error', err);
-    res.status(500).json({ error: 'Internal Server Error' });
+    console.error('GET /strings/:stringValue error:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
@@ -321,9 +327,9 @@ app.use((req, res) => {
 const PORT = process.env.PORT || 3000;
 
 (async () => {
-  await tryConnectMongoose(); // attempt DB connection but will not exit on failure
+  await tryConnectMongoose();
   app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT} (using_in_memory=${useInMemory})`);
+    console.log(`Server running on port ${PORT} (using_in_memory=${useInMemory})`);
   });
 })();
 
